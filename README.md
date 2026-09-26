@@ -1,41 +1,63 @@
 # Real-Time Vehicle Analytics Pipeline
 
-A Python-only vehicle analytics demo that publishes a traffic video over RTSP, detects and tracks vehicles, classifies their visible color, records one event per line crossing in PostgreSQL, and displays live totals in a browser dashboard.
+A Python-only, end-to-end vehicle analytics system for an RTSP traffic stream. It publishes a local video through MediaMTX, detects and tracks vehicles, estimates each crossing vehicle's visible color from its bounding-box crop, stores crossing events in PostgreSQL, and displays durable live analytics in a browser.
+
+## What it delivers
+
+- **RTSP ingestion:** MediaMTX brokers an RTSP publisher at `rtsp://localhost:8554/traffic` and exposes HLS at `http://localhost:8888/traffic/index.m3u8`.
+- **Vehicle inference:** Ultralytics YOLO detects COCO vehicle classes: car, motorcycle, bus, and truck.
+- **Persistent tracking:** ByteTrack assigns object IDs across frames.
+- **Color classification:** The pipeline classifies the central pixels of every crossing vehicle crop in HSV space.
+- **Accurate counting:** A horizontal boundary emits an event only when a tracked center crosses sides. In-memory state and a PostgreSQL unique constraint ensure each tracker ID is counted once per pipeline run.
+- **Analytics dashboard:** Streamlit shows total crossings, color counts, and the most recent persistent events, refreshing every two seconds.
+
+The original brief proposes NVIDIA DeepStream. This implementation deliberately uses Python-only, cross-platform components as requested: Ultralytics YOLO + ByteTrack provide the detector and tracker; the cropped color classifier is the secondary classification stage. It runs on Windows and CPU-only machines, while automatically using CUDA if the installed PyTorch build supports it.
 
 ## Architecture
 
 ```text
-traffic.mp4 ──► FFmpeg (Python-managed) ──► MediaMTX / RTSP
-                                                   │
-                                                   ▼
-                       YOLO detector ─► ByteTrack IDs ─► crop color classifier
-                                                   │
-                                      line crossing event
-                                                   ▼
-                                             PostgreSQL
-                                                   │
-                                                   ▼
-                                      Streamlit dashboard
+traffic.mp4 / camera
+        |
+        v
+FFmpeg publisher (Python-managed) ---> MediaMTX RTSP/HLS
+                                           |
+                                           v
+                       YOLO vehicle detector -> ByteTrack IDs
+                                           |
+                                           v
+                         cropped HSV color classifier -> boundary crossing
+                                                                |
+                                          async SQLAlchemy writes v
+                                                         PostgreSQL
+                                                                |
+                                                                v
+                                                   Streamlit dashboard
 ```
 
-The task mentions NVIDIA DeepStream and React. This implementation keeps the full inference and user interface in Python: Ultralytics YOLO with ByteTrack provides detection and persistent tracking, and Streamlit provides the dashboard. That makes the project runnable on a CPU-only Windows host as well as CUDA-enabled Python environments, without requiring the Linux/NVIDIA-specific DeepStream runtime or a separate JavaScript build chain.
+## Repository layout
 
-## Included components
+| Path | Purpose |
+| --- | --- |
+| `pipeline.py` | Inference loop, ByteTrack state, line-crossing logic, and asynchronous persistence. |
+| `db.py` | SQLAlchemy schema and transactional event repository. |
+| `app.py` | Streamlit live dashboard. |
+| `scripts/publish_video.py` | Loops an MP4 or publishes a Windows DirectShow camera to RTSP. |
+| `docker-compose.yml` | PostgreSQL 16 and MediaMTX services. |
+| `mediamtx.yml` | RTSP/HLS path configuration. |
+| `tests/` | Unit tests for color, boundary, single-count, and persistence behavior. |
 
-- `scripts/publish_video.py` publishes the included MP4 in a loop to MediaMTX. Its FFmpeg executable is supplied by the Python `imageio-ffmpeg` dependency.
-- `pipeline.py` filters YOLO detections to cars, motorcycles, buses, and trucks; uses persistent ByteTrack IDs; classifies the central region of each vehicle crop; and writes the first line crossing per track asynchronously.
-- `app.py` defines the PostgreSQL event schema and serves the dashboard. Metrics are queried from the database, so they survive process restarts.
-- `docker-compose.yml` runs PostgreSQL 16 and MediaMTX. The database volume is retained when containers stop.
+## Prerequisites
 
-## Requirements
+- Windows 10/11 or another Python-supported OS
+- Python 3.11+
+- Docker Desktop running (Docker Compose supplies PostgreSQL and MediaMTX)
+- Git
 
-- Windows 10/11, Python 3.11+, and Git.
-- Docker Desktop installed and running. Docker Compose provides PostgreSQL and MediaMTX, so separate installations of those services are not needed.
-- The first YOLO run downloads `yolo11n.pt` from Ultralytics. CPU inference works without NVIDIA hardware; a compatible CUDA-enabled PyTorch installation can accelerate inference.
+The first inference run downloads `yolo11n.pt` from Ultralytics. The included `traffic.mp4` is the demonstration input. A CUDA-enabled PyTorch installation is optional; CPU inference works but is slower.
 
 ## Setup
 
-Run these commands in PowerShell from the repository directory:
+In PowerShell at the repository root:
 
 ```powershell
 Copy-Item .env.example .env
@@ -43,64 +65,90 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install --upgrade pip
 .\.venv\Scripts\python -m pip install -r requirements.txt
 docker compose up -d postgres mediamtx
-```
-
-Wait for PostgreSQL to report healthy:
-
-```powershell
 docker compose ps
 ```
 
-## Run the pipeline
+Wait until the `postgres` service reports `healthy`. The default credentials are local development credentials in `.env`; use a different `DATABASE_URL` in any shared environment.
 
-Use three terminals, each with the repository as its working directory. Start the video publisher:
+## Run the system
+
+Open three PowerShell terminals at the repository root.
+
+**1. Publish the sample video**
 
 ```powershell
-.\.venv\Scripts\python scripts/publish_video.py
+.\.venv\Scripts\python scripts\publish_video.py
 ```
 
-The source video is looped until the process is stopped with Ctrl+C. MediaMTX exposes the RTSP stream at `rtsp://localhost:8554/traffic` and HLS at `http://localhost:8888/traffic/index.m3u8`. The RTSP URL can be opened in VLC while the publisher is running.
+The video loops indefinitely. Open `rtsp://localhost:8554/traffic` in VLC to verify RTSP delivery. The HLS stream is at `http://localhost:8888/traffic/index.m3u8`.
 
-Start inference in a second terminal:
+To publish a different file or a Windows DirectShow camera:
+
+```powershell
+.\.venv\Scripts\python scripts\publish_video.py --input "C:\videos\junction.mp4"
+.\.venv\Scripts\python scripts\publish_video.py --camera --input "Integrated Camera"
+```
+
+**2. Start inference and counting**
 
 ```powershell
 .\.venv\Scripts\python pipeline.py --show
 ```
 
-Press `q` in the preview window to stop inference. Omit `--show` to run without an annotated preview. To choose a different source or counting line:
+Press `q` in the annotated video window to stop. `--show` is optional. Use `--max-frames 300` for a bounded smoke run. The pipeline reads the following settings from `.env` or the environment:
 
-```powershell
-.\.venv\Scripts\python pipeline.py --source "rtsp://localhost:8554/traffic" --line-ratio 0.60
-```
+| Setting | Default | Description |
+| --- | --- | --- |
+| `DATABASE_URL` | local PostgreSQL DSN | SQLAlchemy PostgreSQL connection URL. |
+| `RTSP_URL` | `rtsp://localhost:8554/traffic` | Input stream and publisher target. |
+| `YOLO_MODEL` | `yolo11n.pt` | Ultralytics model name or local path. |
+| `LINE_RATIO` | `0.55` | Counting line as a fraction of frame height, exclusive of 0 and 1. |
 
-The line ratio is a fraction of the frame height and must be between 0 and 1. The default is `0.55`. For a bounded sample run, add `--max-frames 300`. Set `RTSP_URL`, `YOLO_MODEL`, `LINE_RATIO`, and `DATABASE_URL` in `.env` to configure the app. The included video is expected at `traffic.mp4`; pass a different file to the publisher with `--input`.
-
-Start the dashboard in a third terminal:
+**3. Start the dashboard**
 
 ```powershell
 .\.venv\Scripts\python -m streamlit run app.py
 ```
 
-Streamlit prints the local dashboard URL (normally `http://localhost:8501`). It refreshes the database totals and recent events every two seconds. The page includes the total crossing count, color breakdown, and latest event table.
+Open the URL Streamlit prints, usually `http://localhost:8501`.
 
-## Event schema and counting behavior
+## Implementation details
 
-`detection_events` stores the unique database ID, a run-namespaced tracker ID, vehicle type, estimated color, crossing direction, detector confidence, and timezone-aware UTC timestamp. The horizontal line is positioned at `LINE_RATIO` of the frame height. The pipeline compares each track's center between frames and emits `north_to_south` or `south_to_north` the first time that ID changes sides. A new run receives a distinct ID namespace. Inserts use a bounded two-worker thread pool so a database write does not block frame inference; write failures are logged.
+### Counting behavior
 
-YOLO only processes the COCO vehicle classes (`car`, `motorcycle`, `bus`, and `truck`). ByteTrack assigns IDs between frames. The color estimate uses HSV statistics from the center of each detected vehicle crop to reduce road and background pixels. It is a visual estimate and can return `unknown` for an empty crop.
+For each ByteTrack ID, the pipeline retains its last vertical center. A crossing is recorded when the center moves from above to on/below the horizontal line (`north_to_south`) or from below to on/above it (`south_to_north`). The track state flips to counted before the database job is queued. Stale tracks are removed after 60 seconds.
 
-## Verification
+Each pipeline process has a random `run_id`. The `detection_events` table has a unique `(run_id, tracker_id)` constraint, which makes a duplicate write harmless even if a retry occurs. Database insertion runs in a bounded two-worker thread pool so slow I/O does not block frame inference.
+
+### Schema
+
+`detection_events` stores the primary key, run and tracker IDs, vehicle class, color, direction, detector confidence, and a timezone-aware UTC crossing timestamp. The schema is created idempotently at service start. Database data persists in Docker's named `postgres_data` volume.
+
+### Color estimates
+
+The classifier crops the central 60% of the vehicle bounding box to reduce road and background pixels. It uses median HSV saturation/value for black, white, and gray, then median hue for red, orange, yellow, green, blue, and purple. This is intentionally interpretable and lightweight; color labels are visual estimates and can be affected by lighting, reflections, and occlusion.
+
+## Test and verification
+
+Run the unit suite:
 
 ```powershell
 .\.venv\Scripts\python -m pytest -q
-docker compose ps
 ```
 
-For a complete live check, run the publisher, pipeline, and dashboard in separate terminals. Confirm the RTSP stream opens in VLC, then verify that crossing events appear in the dashboard. The pure unit tests cover crossing direction and color classification.
+The tests cover boundary directions, duplicate prevention for a re-crossing tracker, neutral and colored crop classification, and the database uniqueness/dashboard query path using a temporary SQLite database.
 
-## Stop services
+For an end-to-end check, start both Docker services, run the publisher and pipeline, then confirm that events appear in the dashboard after vehicles cross the drawn yellow line. `docker compose ps` should show PostgreSQL as healthy.
+
+## Stop or reset services
 
 ```powershell
-docker compose down       # stop containers and retain database records
-docker compose down -v    # also remove the local PostgreSQL volume and records
+docker compose down       # stop services and keep event data
+docker compose down -v    # stop services and remove the local PostgreSQL volume
 ```
+
+## Known operational limits
+
+- Stable tracking depends on camera angle, frame rate, and scene congestion. Adjust the detector model, confidence threshold, or counting line for a deployed camera.
+- The demo starts with the small `yolo11n` model to keep local setup practical. A larger compatible YOLO model can improve accuracy at additional compute cost.
+- The dashboard reads persisted events and does not embed annotated video. The RTSP/HLS endpoints remain available for a dedicated player.
