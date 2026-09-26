@@ -7,4 +7,5 @@ ultralytics==8.3.94
 lap==0.5.13
 python-dotenv==1.1.0
 imageio-ffmpeg==0.6.0
+pandas==2.2.3
 pytest==8.3.5
