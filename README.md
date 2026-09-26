@@ -73,7 +73,7 @@ Press `q` in the preview window to stop inference. Omit `--show` to run without 
 .\.venv\Scripts\python pipeline.py --source "rtsp://localhost:8554/traffic" --line-ratio 0.60
 ```
 
-The line ratio is a fraction of the frame height and must be between 0 and 1. The default is `0.55`. Set `RTSP_URL`, `YOLO_MODEL`, `LINE_RATIO`, and `DATABASE_URL` in `.env` to configure the app. The included video is expected at `traffic.mp4`; pass a different file to the publisher with `--input`.
+The line ratio is a fraction of the frame height and must be between 0 and 1. The default is `0.55`. For a bounded sample run, add `--max-frames 300`. Set `RTSP_URL`, `YOLO_MODEL`, `LINE_RATIO`, and `DATABASE_URL` in `.env` to configure the app. The included video is expected at `traffic.mp4`; pass a different file to the publisher with `--input`.
 
 Start the dashboard in a third terminal:
 

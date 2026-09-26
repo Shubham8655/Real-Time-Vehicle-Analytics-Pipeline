@@ -5,12 +5,9 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-import pandas as pd
-import streamlit as st
 from dotenv import load_dotenv
 from sqlalchemy import DateTime, Integer, String, create_engine, desc, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from streamlit_autorefresh import st_autorefresh
 
 load_dotenv()
 DATABASE_URL = os.getenv(
@@ -32,7 +29,7 @@ class DetectionEvent(Base):
     vehicle_type: Mapped[str] = mapped_column(String(32))
     color: Mapped[str] = mapped_column(String(24), index=True)
     direction: Mapped[str] = mapped_column(String(32), index=True)
-    confidence: Mapped[float] = mapped_column()
+    confidence: Mapped[int] = mapped_column(Integer)  # Stored as a percentage for compatibility.
     crossed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -57,7 +54,7 @@ def insert_event(
             vehicle_type=vehicle_type,
             color=color,
             direction=direction,
-            confidence=confidence,
+            confidence=round(confidence * 100),
             crossed_at=event_time,
         )
         session.add(row)
@@ -83,7 +80,7 @@ def get_dashboard_data(limit: int = 50) -> tuple[int, dict[str, int], list[dict[
             "Vehicle": row.vehicle_type,
             "Color": row.color,
             "Direction": row.direction.replace("_", " "),
-            "Confidence": f"{row.confidence:.0%}",
+            "Confidence": f"{row.confidence}%",
             "Track ID": row.vehicle_id,
         }
         for row in rows
@@ -93,6 +90,10 @@ def get_dashboard_data(limit: int = 50) -> tuple[int, dict[str, int], list[dict[
 
 def main() -> None:
     """Render a periodically refreshed dashboard without side effects on import."""
+    import pandas as pd
+    import streamlit as st
+    from streamlit_autorefresh import st_autorefresh
+
     st.set_page_config(page_title="Vehicle Analytics", page_icon="🚦", layout="wide")
     st_autorefresh(interval=2000, key="dashboard_refresh")
     st.title("🚦 Real-Time Vehicle Analytics")

@@ -4,6 +4,7 @@ sqlalchemy==2.0.40
 psycopg[binary]==3.2.6
 opencv-python==4.11.0.86
 ultralytics==8.3.94
+lap==0.5.13
 python-dotenv==1.1.0
 imageio-ffmpeg==0.6.0
 pytest==8.3.5

@@ -5,11 +5,21 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
+import sys
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+# OpenCV's FFmpeg backend reads RTSP options from the process environment at startup.
+# Re-exec once so a normal `python pipeline.py` command inherits TCP before OpenCV loads.
+if __name__ == "__main__" and "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
+    process_env = os.environ.copy()
+    process_env["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+    child = subprocess.run([sys.executable, *sys.argv], env=process_env, check=False)
+    raise SystemExit(child.returncode)
 
 import cv2
 import numpy as np
@@ -78,7 +88,13 @@ def _persist_event(future: Future[int], vehicle_id: str) -> None:
         LOG.exception("Could not persist crossing event for track %s", vehicle_id)
 
 
-def run(source: str, line_ratio: float, show: bool, model_path: str) -> None:
+def run(
+    source: str,
+    line_ratio: float,
+    show: bool,
+    model_path: str,
+    max_frames: int | None = None,
+) -> None:
     """Run a persistent ByteTrack tracker and asynchronously write crossing events."""
     initialize_database()
     model = YOLO(model_path)
@@ -95,7 +111,7 @@ def run(source: str, line_ratio: float, show: bool, model_path: str) -> None:
         verbose=False,
     )
     try:
-        for result in results:
+        for frame_number, result in enumerate(results, start=1):
             frame = result.orig_img
             now = time.monotonic()
             line_y = int(frame.shape[0] * line_ratio)
@@ -143,6 +159,8 @@ def run(source: str, line_ratio: float, show: bool, model_path: str) -> None:
                 cv2.imshow("Vehicle Analytics", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+            if max_frames is not None and frame_number >= max_frames:
+                break
     finally:
         executor.shutdown(wait=True)
         if show:
@@ -155,12 +173,15 @@ def main() -> None:
     parser.add_argument("--source", default=os.getenv("RTSP_URL", "rtsp://localhost:8554/traffic"))
     parser.add_argument("--line-ratio", type=float, default=float(os.getenv("LINE_RATIO", "0.55")))
     parser.add_argument("--model", default=os.getenv("YOLO_MODEL", "yolo11n.pt"))
+    parser.add_argument("--max-frames", type=int, help="Stop after this many frames (useful for short checks)")
     parser.add_argument("--show", action="store_true", help="Display annotated frames; press q to stop")
     args = parser.parse_args()
     if not 0 < args.line_ratio < 1:
         parser.error("--line-ratio must be between 0 and 1")
+    if args.max_frames is not None and args.max_frames < 1:
+        parser.error("--max-frames must be a positive integer")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(args.source, args.line_ratio, args.show, args.model)
+    run(args.source, args.line_ratio, args.show, args.model, args.max_frames)
 
 
 if __name__ == "__main__":
