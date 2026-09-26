@@ -1,4 +1,3 @@
-# A publisher (FFmpeg or a camera) may publish to rtsp://localhost:8554/traffic.
 rtsp: true
 rtspAddress: :8554
 hls: true

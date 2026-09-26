@@ -1,8 +1,9 @@
-fastapi==0.115.12
-uvicorn[standard]==0.34.0
-sqlalchemy==2.0.38
-psycopg[binary]==3.2.5
+streamlit==1.44.1
+streamlit-autorefresh==1.0.1
+sqlalchemy==2.0.40
+psycopg[binary]==3.2.6
 opencv-python==4.11.0.86
-ultralytics==8.3.90
-python-dotenv==1.0.1
+ultralytics==8.3.94
+python-dotenv==1.1.0
+imageio-ffmpeg==0.6.0
 pytest==8.3.5

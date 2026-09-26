@@ -1,9 +1,9 @@
 .venv/
 __pycache__/
-*.py[cod]
 .pytest_cache/
+.streamlit/
 .env
-data/
-*.db
+*.py[cod]
 *.log
-traffic.mp4
+yolo*.pt
+runs/

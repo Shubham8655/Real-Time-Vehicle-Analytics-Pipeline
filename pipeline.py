@@ -1,12 +1,13 @@
-"""Python-only vehicle detector, tracker, colour classifier, and line counter."""
+"""Detect, track, classify, and count vehicles from a video or RTSP stream."""
 
 from __future__ import annotations
 
 import argparse
 import logging
 import os
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -15,33 +16,35 @@ import numpy as np
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
-from app import EventInput, initialize_database, insert_event
+from app import initialize_database, insert_event
 
-VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}  # COCO labels.
+VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+LOG = logging.getLogger("vehicle_pipeline")
 
 
 @dataclass
 class TrackState:
-    """The last observed centre and a one-shot crossing flag for an object ID."""
+    """Small amount of state retained for each current tracker ID."""
 
     center_y: float
+    last_seen: float
     counted: bool = False
 
 
 def classify_color(crop: np.ndarray) -> str:
-    """Classify the central vehicle crop by HSV; avoids road/background pixels at the edges."""
+    """Estimate a vehicle's dominant visible color from its central crop area."""
     if crop.size == 0:
         return "unknown"
     height, width = crop.shape[:2]
-    crop = crop[height // 5 : height * 4 // 5, width // 5 : width * 4 // 5]
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    # Low saturation colours are best distinguished using brightness.
-    if float(np.median(saturation)) < 45:
-        if float(np.median(value)) < 55:
+    central = crop[height // 5 : max(height // 5 + 1, height * 4 // 5),
+                   width // 5 : max(width // 5 + 1, width * 4 // 5)]
+    hsv = cv2.cvtColor(central, cv2.COLOR_BGR2HSV)
+    saturation = float(np.median(hsv[:, :, 1]))
+    value = float(np.median(hsv[:, :, 2]))
+    if saturation < 45:
+        if value < 55:
             return "black"
-        if float(np.median(value)) > 185:
+        if value > 185:
             return "white"
         return "gray"
     hue = int(np.median(hsv[:, :, 0]))
@@ -55,13 +58,11 @@ def classify_color(crop: np.ndarray) -> str:
         return "green"
     if hue < 135:
         return "blue"
-    if hue < 170:
-        return "purple"
-    return "unknown"
+    return "purple"
 
 
 def crossed_line(previous_y: float, current_y: float, line_y: int) -> str | None:
-    """Return the travel direction only when the bounding-box centre changes sides."""
+    """Return the direction when a tracked center changes sides of a horizontal line."""
     if previous_y < line_y <= current_y:
         return "north_to_south"
     if previous_y > line_y >= current_y:
@@ -69,15 +70,21 @@ def crossed_line(previous_y: float, current_y: float, line_y: int) -> str | None
     return None
 
 
-def run(source: str, line_ratio: float, show: bool) -> None:
-    """Track each vehicle from an RTSP/file source and asynchronously persist crossings."""
-    initialize_database()
-    model = YOLO(os.getenv("YOLO_MODEL", "yolo11n.pt"))
-    tracks: dict[int, TrackState] = {}
-    recent_ids: deque[int] = deque(maxlen=2_000)
-    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="db-writer")
+def _persist_event(future: Future[int], vehicle_id: str) -> None:
+    """Surface asynchronous database errors in the inference process log."""
+    try:
+        future.result()
+    except Exception:
+        LOG.exception("Could not persist crossing event for track %s", vehicle_id)
 
-    # Ultralytics' ByteTrack runs in Python and provides persistent per-object IDs.
+
+def run(source: str, line_ratio: float, show: bool, model_path: str) -> None:
+    """Run a persistent ByteTrack tracker and asynchronously write crossing events."""
+    initialize_database()
+    model = YOLO(model_path)
+    stream_id = uuid.uuid4().hex[:8]
+    tracks: dict[int, TrackState] = {}
+    executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="event-writer")
     results = model.track(
         source=source,
         stream=True,
@@ -90,51 +97,71 @@ def run(source: str, line_ratio: float, show: bool) -> None:
     try:
         for result in results:
             frame = result.orig_img
+            now = time.monotonic()
             line_y = int(frame.shape[0] * line_ratio)
-            cv2.line(frame, (0, line_y), (frame.shape[1], line_y), (0, 255, 255), 2)
-            if result.boxes.id is not None:
-                boxes = result.boxes.xyxy.cpu().numpy().astype(int)
-                ids = result.boxes.id.int().cpu().tolist()
-                classes = result.boxes.cls.int().cpu().tolist()
-                confidences = result.boxes.conf.cpu().tolist()
-                for (x1, y1, x2, y2), track_id, class_id, confidence in zip(boxes, ids, classes, confidences):
+            cv2.line(frame, (0, line_y), (frame.shape[1], line_y), (0, 220, 255), 2)
+            boxes = result.boxes
+            if boxes is not None and boxes.id is not None:
+                coordinates = boxes.xyxy.cpu().numpy().astype(int)
+                identifiers = boxes.id.int().cpu().tolist()
+                class_ids = boxes.cls.int().cpu().tolist()
+                confidences = boxes.conf.cpu().tolist()
+                for (x1, y1, x2, y2), track_id, class_id, confidence in zip(
+                    coordinates, identifiers, class_ids, confidences
+                ):
+                    previous = tracks.get(track_id)
                     center_y = (y1 + y2) / 2
-                    state = tracks.get(track_id)
-                    direction = crossed_line(state.center_y, center_y, line_y) if state else None
-                    tracks[track_id] = TrackState(center_y=center_y, counted=state.counted if state else False)
-                    if direction and not tracks[track_id].counted:
-                        crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-                        event = EventInput(
-                            vehicle_id=str(track_id),
-                            vehicle_type=VEHICLE_CLASSES[class_id],
-                            color=classify_color(crop),
-                            direction=direction,
-                            confidence=round(confidence * 100),
-                            crossed_at=datetime.now(timezone.utc),
-                        )
-                        executor.submit(insert_event, event)
+                    direction = crossed_line(previous.center_y, center_y, line_y) if previous else None
+                    already_counted = previous.counted if previous else False
+                    tracks[track_id] = TrackState(center_y, now, already_counted)
+                    x1, x2 = max(0, x1), min(frame.shape[1], x2)
+                    y1, y2 = max(0, y1), min(frame.shape[0], y2)
+                    label = VEHICLE_CLASSES[class_id]
+                    if direction and not already_counted:
+                        vehicle_id = f"{stream_id}:{track_id}"
+                        event = {
+                            "vehicle_id": vehicle_id,
+                            "vehicle_type": label,
+                            "color": classify_color(frame[y1:y2, x1:x2]),
+                            "direction": direction,
+                            "confidence": float(confidence),
+                            "crossed_at": datetime.now(timezone.utc),
+                        }
+                        future = executor.submit(insert_event, **event)
+                        future.add_done_callback(lambda completed, key=vehicle_id: _persist_event(completed, key))
                         tracks[track_id].counted = True
-                        logging.info("counted vehicle=%s color=%s direction=%s", track_id, event.color, direction)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
-                    cv2.putText(frame, f"{VEHICLE_CLASSES[class_id]} #{track_id}", (x1, max(20, y1 - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 0), 2)
+                        LOG.info("counted track=%s type=%s color=%s direction=%s", vehicle_id, label,
+                                 event["color"], direction)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 210, 70), 2)
+                    cv2.putText(frame, f"{label} #{track_id}", (x1, max(20, y1 - 7)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 210, 70), 2)
+                # Drop IDs that ByteTrack has not observed recently; avoids unbounded growth.
+                stale = [key for key, state in tracks.items() if now - state.last_seen > 60]
+                for key in stale:
+                    del tracks[key]
             if show:
                 cv2.imshow("Vehicle Analytics", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
         executor.shutdown(wait=True)
-        cv2.destroyAllWindows()
+        if show:
+            cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":
+def main() -> None:
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Run the Python vehicle analytics pipeline.")
+    parser = argparse.ArgumentParser(description="Run Python vehicle detection and line counting.")
     parser.add_argument("--source", default=os.getenv("RTSP_URL", "rtsp://localhost:8554/traffic"))
-    parser.add_argument("--line-ratio", type=float, default=0.55, help="Horizontal line as fraction of frame height")
-    parser.add_argument("--show", action="store_true", help="Show annotated frames; press q to exit")
+    parser.add_argument("--line-ratio", type=float, default=float(os.getenv("LINE_RATIO", "0.55")))
+    parser.add_argument("--model", default=os.getenv("YOLO_MODEL", "yolo11n.pt"))
+    parser.add_argument("--show", action="store_true", help="Display annotated frames; press q to stop")
     args = parser.parse_args()
     if not 0 < args.line_ratio < 1:
         parser.error("--line-ratio must be between 0 and 1")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(args.source, args.line_ratio, args.show)
+    run(args.source, args.line_ratio, args.show, args.model)
+
+
+if __name__ == "__main__":
+    main()
