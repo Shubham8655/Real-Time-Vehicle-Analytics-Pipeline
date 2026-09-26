@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Vehicle Analytics</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#0b1020;color:#eaf0ff;margin:0;padding:2rem;max-width:1100px;margin:auto}h1{margin:0}.sub{color:#9eadd0}.metrics{display:flex;gap:1rem;flex-wrap:wrap;margin:1.5rem 0}.card{background:#151d34;padding:1.2rem;border-radius:12px;min-width:150px}.value{font-size:2rem;font-weight:700;color:#62d8ff}table{width:100%;border-collapse:collapse;background:#151d34;border-radius:12px;overflow:hidden}th,td{text-align:left;padding:.75rem;border-bottom:1px solid #273150}th{color:#9eadd0}@media(max-width:600px){body{padding:1rem}table{font-size:.8rem}th,td{padding:.45rem}}
+</style></head>
+<body><h1>Vehicle Analytics</h1><p class="sub">Live line-crossing events • refreshes every 2 seconds</p>
+<section class="metrics"><div class="card">Total crossings<div id="total" class="value">0</div></div><div class="card">By colour<div id="colors" class="value">—</div></div></section>
+<table><thead><tr><th>Time</th><th>Track ID</th><th>Type</th><th>Colour</th><th>Direction</th><th>Confidence</th></tr></thead><tbody id="events"><tr><td colspan="6">Waiting for events…</td></tr></tbody></table>
+<script>
+async function refresh(){try{const[m,e]=await Promise.all([fetch('/api/metrics').then(r=>r.json()),fetch('/api/events').then(r=>r.json())]);total.textContent=m.total;colors.textContent=Object.entries(m.by_color).map(([c,n])=>`${c}: ${n}`).join(' · ')||'—';events.innerHTML=e.length?e.map(x=>`<tr><td>${new Date(x.crossed_at).toLocaleString()}</td><td>${x.vehicle_id}</td><td>${x.vehicle_type}</td><td>${x.color}</td><td>${x.direction.replaceAll('_',' ')}</td><td>${x.confidence}%</td></tr>`).join(''):'<tr><td colspan="6">Waiting for a vehicle to cross the line…</td></tr>';}catch(err){console.error(err)}}refresh();setInterval(refresh,2000);
+</script></body></html>

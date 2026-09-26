@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: vehicle_analytics
+      POSTGRES_USER: vehicle
+      POSTGRES_PASSWORD: vehicle
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vehicle -d vehicle_analytics"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.15.4
+    ports:
+      - "8554:8554" # RTSP input/output
+      - "8888:8888" # HLS output
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+
+volumes:
+  postgres_data:
