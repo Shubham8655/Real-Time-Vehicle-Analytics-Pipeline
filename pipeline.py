@@ -13,8 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-# OpenCV's FFmpeg backend reads RTSP options at process start. Re-exec the CLI
-# once so RTSP streams use TCP before OpenCV is imported by Ultralytics.
+# OpenCV reads RTSP transport options before importing the capture backend.
 if __name__ == "__main__" and "OPENCV_FFMPEG_CAPTURE_OPTIONS" not in os.environ:
     child_environment = os.environ.copy()
     child_environment["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -33,7 +32,7 @@ LOG = logging.getLogger("vehicle_pipeline")
 
 @dataclass
 class TrackState:
-    """The state needed to count each persistent tracker ID at most once."""
+    """Minimum state needed to count a persistent tracker ID just once."""
 
     center_y: float
     last_seen: float
@@ -41,11 +40,7 @@ class TrackState:
 
 
 def classify_color(crop: np.ndarray) -> str:
-    """Estimate a vehicle's visible color from the central part of its crop.
-
-    HSV separates brightness and saturation from hue, making neutral vehicles
-    distinguishable from colored ones without another heavyweight model.
-    """
+    """Estimate visible vehicle color from the central portion of a BGR crop."""
     if crop.size == 0:
         return "unknown"
     height, width = crop.shape[:2]
@@ -54,14 +49,9 @@ def classify_color(crop: np.ndarray) -> str:
         width // 5 : max(width // 5 + 1, width * 4 // 5),
     ]
     hsv = cv2.cvtColor(central, cv2.COLOR_BGR2HSV)
-    saturation = float(np.median(hsv[:, :, 1]))
-    value = float(np.median(hsv[:, :, 2]))
+    saturation, value = float(np.median(hsv[:, :, 1])), float(np.median(hsv[:, :, 2]))
     if saturation < 45:
-        if value < 55:
-            return "black"
-        if value > 185:
-            return "white"
-        return "gray"
+        return "black" if value < 55 else "white" if value > 185 else "gray"
     hue = int(np.median(hsv[:, :, 0]))
     if hue < 10 or hue >= 170:
         return "red"
@@ -77,7 +67,7 @@ def classify_color(crop: np.ndarray) -> str:
 
 
 def crossed_line(previous_y: float, current_y: float, line_y: int) -> str | None:
-    """Return direction if a center point moved through a horizontal line."""
+    """Return a direction only when a center point crosses the horizontal boundary."""
     if previous_y < line_y <= current_y:
         return "north_to_south"
     if previous_y > line_y >= current_y:
@@ -88,7 +78,7 @@ def crossed_line(previous_y: float, current_y: float, line_y: int) -> str | None
 def update_track(
     tracks: dict[int, TrackState], track_id: int, center_y: float, line_y: int, seen_at: float
 ) -> str | None:
-    """Update a track and return its first crossing direction, if any."""
+    """Update a tracked center and return its first crossing direction, if any."""
     previous = tracks.get(track_id)
     direction = crossed_line(previous.center_y, center_y, line_y) if previous else None
     counted = previous.counted if previous else False
@@ -100,98 +90,66 @@ def update_track(
 
 
 def _log_write_result(future: Future[int | None], vehicle_id: str) -> None:
-    """Report asynchronous database outcomes without interrupting inference."""
+    """Log asynchronous database errors without stopping video inference."""
     try:
-        inserted_id = future.result()
-        if inserted_id is None:
+        if future.result() is None:
             LOG.warning("duplicate event prevented for track %s", vehicle_id)
     except Exception:
         LOG.exception("could not persist crossing event for track %s", vehicle_id)
 
 
 def run(
-    *,
-    source: str,
-    line_ratio: float,
-    show: bool,
-    model_path: str,
-    repository: EventRepository,
-    max_frames: int | None = None,
+    *, source: str, line_ratio: float, show: bool, model_path: str,
+    repository: EventRepository, max_frames: int | None = None,
 ) -> None:
-    """Run YOLO + ByteTrack against a file or RTSP stream and persist crossings."""
+    """Run YOLO + ByteTrack against a file or RTSP source and persist crossings."""
     if not 0 < line_ratio < 1:
         raise ValueError("line_ratio must be between 0 and 1")
     if max_frames is not None and max_frames < 1:
         raise ValueError("max_frames must be a positive integer")
 
-    # Delayed import keeps pure geometry/color tests fast and independent of Torch.
-    from ultralytics import YOLO
+    from ultralytics import YOLO  # Delayed so logic tests do not require model loading.
 
     repository.initialize()
-    model = YOLO(model_path)
-    run_id = uuid.uuid4().hex[:12]
+    model, run_id = YOLO(model_path), uuid.uuid4().hex[:12]
     tracks: dict[int, TrackState] = {}
     executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="event-writer")
     results = model.track(
-        source=source,
-        stream=True,
-        persist=True,
-        tracker="bytetrack.yaml",
-        classes=list(VEHICLE_CLASSES),
-        conf=0.35,
-        verbose=False,
+        source=source, stream=True, persist=True, tracker="bytetrack.yaml",
+        classes=list(VEHICLE_CLASSES), conf=0.35, verbose=False,
     )
     LOG.info("pipeline run %s started from %s", run_id, source)
     try:
         for frame_number, result in enumerate(results, start=1):
-            frame = result.orig_img
-            now = time.monotonic()
+            frame, now = result.orig_img, time.monotonic()
             line_y = int(frame.shape[0] * line_ratio)
             boxes = result.boxes
             if boxes is not None and boxes.id is not None:
                 coordinates = boxes.xyxy.cpu().numpy().astype(int)
                 identifiers = boxes.id.int().cpu().tolist()
-                class_ids = boxes.cls.int().cpu().tolist()
-                confidences = boxes.conf.cpu().tolist()
+                class_ids, confidences = boxes.cls.int().cpu().tolist(), boxes.conf.cpu().tolist()
                 for (x1, y1, x2, y2), tracker_id, class_id, confidence in zip(
                     coordinates, identifiers, class_ids, confidences
                 ):
-                    center_y = (y1 + y2) / 2
-                    direction = update_track(tracks, tracker_id, center_y, line_y, now)
+                    direction = update_track(tracks, tracker_id, (y1 + y2) / 2, line_y, now)
                     x1, x2 = max(0, x1), min(frame.shape[1], x2)
                     y1, y2 = max(0, y1), min(frame.shape[0], y2)
                     vehicle_type = VEHICLE_CLASSES.get(class_id, "vehicle")
                     if direction:
-                        color = classify_color(frame[y1:y2, x1:x2])
                         future = executor.submit(
-                            repository.insert_crossing,
-                            run_id=run_id,
-                            tracker_id=tracker_id,
-                            vehicle_type=vehicle_type,
-                            color=color,
-                            direction=direction,
-                            confidence=float(confidence),
+                            repository.insert_crossing, run_id=run_id, tracker_id=tracker_id,
+                            vehicle_type=vehicle_type, color=classify_color(frame[y1:y2, x1:x2]),
+                            direction=direction, confidence=float(confidence),
                             crossed_at=datetime.now(timezone.utc),
                         )
                         vehicle_id = f"{run_id}:{tracker_id}"
-                        future.add_done_callback(
-                            lambda completed, key=vehicle_id: _log_write_result(completed, key)
-                        )
-                        LOG.info("counted %s: %s %s moving %s", vehicle_id, color, vehicle_type, direction)
+                        future.add_done_callback(lambda completed, key=vehicle_id: _log_write_result(completed, key))
+                        LOG.info("counted %s moving %s", vehicle_id, direction)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 210, 70), 2)
-                    cv2.putText(
-                        frame,
-                        f"{vehicle_type} #{tracker_id}",
-                        (x1, max(20, y1 - 7)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (30, 210, 70),
-                        2,
-                    )
-
+                    cv2.putText(frame, f"{vehicle_type} #{tracker_id}", (x1, max(20, y1 - 7)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 210, 70), 2)
             cv2.line(frame, (0, line_y), (frame.shape[1], line_y), (0, 220, 255), 2)
-            stale_ids = [track_id for track_id, state in tracks.items() if now - state.last_seen > 60]
-            for stale_id in stale_ids:
+            for stale_id in [key for key, state in tracks.items() if now - state.last_seen > 60]:
                 del tracks[stale_id]
             if show:
                 cv2.imshow("Vehicle Analytics", frame)
@@ -217,14 +175,8 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        run(
-            source=args.source,
-            line_ratio=args.line_ratio,
-            show=args.show,
-            model_path=args.model,
-            repository=EventRepository(settings.database_url),
-            max_frames=args.max_frames,
-        )
+        run(source=args.source, line_ratio=args.line_ratio, show=args.show, model_path=args.model,
+            repository=EventRepository(settings.database_url), max_frames=args.max_frames)
     except ValueError as exc:
         parser.error(str(exc))
 

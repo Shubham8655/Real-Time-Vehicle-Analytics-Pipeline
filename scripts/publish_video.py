@@ -9,7 +9,6 @@ import sys
 
 import imageio_ffmpeg
 
-# Allow `python scripts/publish_video.py` from any working directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,21 +23,8 @@ def build_command(input_value: str, target_url: str, camera: bool) -> list[str]:
         command.extend(["-f", "dshow", "-i", f"video={input_value}"])
     else:
         command.extend(["-stream_loop", "-1", "-i", str(Path(input_value).resolve())])
-    return [
-        *command,
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-tune",
-        "zerolatency",
-        "-f",
-        "rtsp",
-        "-rtsp_transport",
-        "tcp",
-        target_url,
-    ]
+    return [*command, "-an", "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-f", "rtsp", "-rtsp_transport", "tcp", target_url]
 
 
 def main() -> None:
@@ -51,7 +37,6 @@ def main() -> None:
     args = parser.parse_args()
     if not args.camera and not Path(args.input).is_file():
         parser.error(f"video file not found: {args.input}")
-
     print(f"Publishing to {args.url}. Press Ctrl+C to stop.")
     subprocess.run(build_command(args.input, args.url, args.camera), check=True)
 

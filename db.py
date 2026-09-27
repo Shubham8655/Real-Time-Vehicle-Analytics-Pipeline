@@ -59,12 +59,7 @@ class EventRepository:
         confidence: float,
         crossed_at: datetime | None = None,
     ) -> int | None:
-        """Store a crossing and return its ID; duplicate tracker events return ``None``.
-
-        The unique constraint is a second layer of protection in addition to the
-        in-memory tracker state. It prevents duplicate events after retries or a
-        racing asynchronous write.
-        """
+        """Store a crossing and return its ID; duplicate tracker events return ``None``."""
         event = DetectionEvent(
             run_id=run_id,
             tracker_id=tracker_id,
