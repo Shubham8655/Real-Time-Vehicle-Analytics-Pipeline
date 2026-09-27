@@ -32,16 +32,7 @@ def test_color_classifier_identifies_neutral_and_colored_crops():
 def test_repository_prevents_duplicate_track_events_and_returns_dashboard_data(tmp_path):
     repository = EventRepository(f"sqlite+pysqlite:///{tmp_path / 'analytics.db'}")
     repository.initialize()
-    first_id = repository.insert_crossing(
-        run_id="run-a",
-        tracker_id=42,
-        vehicle_type="car",
-        color="blue",
-        direction="north_to_south",
-        confidence=0.91,
-        crossed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
-    )
-    duplicate_id = repository.insert_crossing(
+    event = dict(
         run_id="run-a",
         tracker_id=42,
         vehicle_type="car",
@@ -49,17 +40,14 @@ def test_repository_prevents_duplicate_track_events_and_returns_dashboard_data(t
         direction="north_to_south",
         confidence=0.91,
     )
+    assert repository.insert_crossing(**event, crossed_at=datetime(2026, 1, 2, tzinfo=timezone.utc)) == 1
+    assert repository.insert_crossing(**event) is None
     total, colors, recent = repository.dashboard_data()
-
-    assert first_id == 1
-    assert duplicate_id is None
-    assert total == 1
-    assert colors == {"blue": 1}
-    assert recent[0]["Track ID"] == "run-a:42"
+    assert (total, colors, recent[0]["Track ID"]) == (1, {"blue": 1}, "run-a:42")
 
 
 class _Tensor:
-    """Small stand-in for the Torch tensor methods used by the pipeline."""
+    """Small stand-in for the tensor methods used by the pipeline."""
 
     def __init__(self, value):
         self.value = np.asarray(value)
@@ -79,16 +67,13 @@ class _Tensor:
 
 class _Boxes:
     def __init__(self, y1, y2):
-        self.xyxy = _Tensor([[10, y1, 30, y2]])
-        self.id = _Tensor([7])
-        self.cls = _Tensor([2])
-        self.conf = _Tensor([0.9])
+        self.xyxy, self.id = _Tensor([[10, y1, 30, y2]]), _Tensor([7])
+        self.cls, self.conf = _Tensor([2]), _Tensor([0.9])
 
 
 class _Result:
     def __init__(self, y1, y2):
-        self.orig_img = np.full((60, 80, 3), 120, dtype=np.uint8)
-        self.boxes = _Boxes(y1, y2)
+        self.orig_img, self.boxes = np.full((60, 80, 3), 120, dtype=np.uint8), _Boxes(y1, y2)
 
 
 class _FakeModel:
@@ -114,7 +99,6 @@ def test_run_persists_one_event_for_a_mocked_tracked_crossing(monkeypatch):
 
     monkeypatch.setattr(ultralytics, "YOLO", lambda _path: _FakeModel())
     repository = _RecordingRepository()
-
     run(
         source="synthetic",
         line_ratio=1 / 3,
@@ -123,7 +107,6 @@ def test_run_persists_one_event_for_a_mocked_tracked_crossing(monkeypatch):
         repository=repository,
         max_frames=2,
     )
-
     assert repository.initialized is True
     assert len(repository.events) == 1
     assert repository.events[0]["tracker_id"] == 7
